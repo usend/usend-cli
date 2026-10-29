@@ -1,0 +1,100 @@
+# Publishes a release of the uSend CLI when a version tag (v1.2.3) arrives. This repository is a mirror: the
+# main repository tags it when it releases the CLI.
+#
+# Builds usend_<os>_<arch>.tar.gz (macOS, Linux) and usend_windows_<arch>.zip with checksums.txt (scripts/build.sh),
+# which https://usend.et/install.sh and install.ps1 download, publishes them as this tag's GitHub release, and
+# updates the Homebrew formula in usend/homebrew-tap (secret HOMEBREW_TAP_KEY: a deploy key with write access there).
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Version from the tag
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "tag $GITHUB_REF_NAME is not v<semver>"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+      - name: Test
+        run: test -z "$(gofmt -l .)" && go vet ./... && go test ./...
+      - name: Build archives
+        run: scripts/build.sh "$VERSION" dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" dist/* --clobber
+          else
+            gh release create "v$VERSION" dist/* --title "usend $VERSION" \
+              --notes "Install or update: \`curl -fsSL https://usend.et/install.sh | bash\` · Windows: \`irm https://usend.et/install.ps1 | iex\` · Homebrew: \`brew install usend/tap/usend\`"
+          fi
+      - name: Update the Homebrew formula
+        env:
+          TAP_KEY: ${{ secrets.HOMEBREW_TAP_KEY }}
+        run: |
+          if [ -z "$TAP_KEY" ]; then echo "HOMEBREW_TAP_KEY is not set: skipping Homebrew"; exit 0; fi
+          sum() { grep " usend_$1.tar.gz\$" dist/checksums.txt | cut -d' ' -f1; }
+          base="https://github.com/usend/usend-cli/releases/download/v$VERSION"
+          umask 077; mkdir -p ~/.ssh
+          printf '%s\n' "$TAP_KEY" > ~/.ssh/tap_key
+          printf 'Host github.com\n  IdentityFile ~/.ssh/tap_key\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n' > ~/.ssh/config
+          git clone --quiet git@github.com:usend/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cat > tap/Formula/usend.rb <<RUBY
+          class Usend < Formula
+            desc "Command-line tool for uSend, the email API"
+            homepage "https://usend.et/docs/tools/cli"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "$base/usend_darwin_arm64.tar.gz"
+                sha256 "$(sum darwin_arm64)"
+              end
+              on_intel do
+                url "$base/usend_darwin_amd64.tar.gz"
+                sha256 "$(sum darwin_amd64)"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/usend_linux_arm64.tar.gz"
+                sha256 "$(sum linux_arm64)"
+              end
+              on_intel do
+                url "$base/usend_linux_amd64.tar.gz"
+                sha256 "$(sum linux_amd64)"
+              end
+            end
+
+            def install
+              bin.install "usend"
+            end
+
+            test do
+              system "#{bin}/usend", "version"
+            end
+          end
+          RUBY
+          sed -i 's/^          //' tap/Formula/usend.rb
+          cd tap
+          git config user.name "usend"; git config user.email "sdk@usend.et"
+          git add Formula/usend.rb
+          git diff --cached --quiet && { echo "formula unchanged"; exit 0; }
+          git commit -q -m "usend $VERSION"
+          git push -q origin HEAD:main
+          echo "Homebrew formula updated to $VERSION"
